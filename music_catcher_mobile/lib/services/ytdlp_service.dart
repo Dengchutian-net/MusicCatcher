@@ -4,12 +4,11 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// yt-dlp 本地执行服务
-/// 通过 Android MethodChannel 在原生层执行 yt-dlp 二进制
+/// 下载到 app 私有目录，复制到 /data/local/tmp/ 执行
 class YtdlpService {
   static const _binaryName = 'yt-dlp';
   static const _channel = MethodChannel('com.musiccatcher/native_exec');
 
-  /// 多个下载源（国内镜像 + 官方），依次尝试
   static const _downloadUrls = [
     'https://ghfast.top/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64',
     'https://ghproxy.cn/https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64',
@@ -18,7 +17,8 @@ class YtdlpService {
   ];
 
   final Dio _dio = Dio();
-  String? _binaryPath;
+  String? _storagePath;   // 存储路径（app 私有目录）
+  String? _execPath;      // 可执行路径（/data/local/tmp/）
   bool _initialized = false;
   String _initStatus = '未初始化';
   double _initProgress = 0;
@@ -27,77 +27,80 @@ class YtdlpService {
   bool get isReady => _initialized;
   String get initStatus => _initStatus;
   double get initProgress => _initProgress;
-  String? get binaryPath => _binaryPath;
   String? get lastError => _lastError;
 
-  /// 获取设备 CPU 架构
   Future<String> getAbi() async {
     try {
-      final abi = await _channel.invokeMethod<String>('getAbi');
-      return abi ?? 'unknown';
+      return await _channel.invokeMethod<String>('getAbi') ?? 'unknown';
     } catch (_) {
       return 'unknown';
     }
   }
 
-  /// 通过原生层设置文件可执行权限
-  Future<bool> _setExecutable(String path) async {
+  /// 将二进制复制到可执行目录
+  Future<String?> _prepareBinary(String srcPath) async {
     try {
-      final result = await _channel.invokeMethod<bool>('setExecutable', {'path': path});
-      return result ?? false;
-    } catch (_) {
-      return false;
+      final result = await _channel.invokeMethod<String>('prepareBinary', {
+        'srcPath': srcPath,
+        'name': _binaryName,
+      });
+      return result;
+    } catch (e) {
+      _lastError = 'prepareBinary 异常: $e';
+      return null;
     }
   }
 
-  /// 初始化：检查或下载 yt-dlp 二进制
   Future<bool> init({void Function(double progress, String status)? onProgress}) async {
     if (_initialized) return true;
     _lastError = null;
 
     try {
       final appDir = await getApplicationDocumentsDirectory();
-      final binDir = Directory('${appDir.path}/bin');
-      if (!await binDir.exists()) {
-        await binDir.create(recursive: true);
+      final storageDir = Directory('${appDir.path}/bin');
+      if (!await storageDir.exists()) {
+        await storageDir.create(recursive: true);
       }
 
-      _binaryPath = '${binDir.path}/$_binaryName';
-      final binaryFile = File(_binaryPath!);
+      _storagePath = '${storageDir.path}/$_binaryName';
+      final storageFile = File(_storagePath!);
 
-      // 检查已有的二进制
-      if (await binaryFile.exists()) {
-        final fileSize = await binaryFile.length();
+      // 检查已下载的二进制
+      if (await storageFile.exists()) {
+        final fileSize = await storageFile.length();
         if (fileSize < 10000) {
-          await binaryFile.delete();
+          await storageFile.delete();
         } else {
-          _initStatus = '验证 yt-dlp...';
+          // 已下载，尝试复制到可执行目录并验证
+          _initStatus = '准备执行环境...';
           onProgress?.call(1.0, _initStatus);
-          final result = await _execBinary(['--version']);
-          if (result['exitCode'] == 0) {
-            _initialized = true;
-            final version = (result['stdout'] as String).trim();
-            _initStatus = 'yt-dlp 就绪 (v$version)';
-            onProgress?.call(1.0, _initStatus);
-            return true;
+
+          _execPath = await _prepareBinary(_storagePath!);
+          if (_execPath != null) {
+            final result = await _execBinary(['--version']);
+            if (result['exitCode'] == 0) {
+              _initialized = true;
+              final version = (result['stdout'] as String).trim();
+              _initStatus = 'yt-dlp 就绪 (v$version)';
+              onProgress?.call(1.0, _initStatus);
+              return true;
+            }
+            _lastError = '执行失败: ${result['stderr']}';
+          } else {
+            _lastError = '无法创建可执行目录';
           }
-          _lastError = '执行失败: ${result['stderr']}';
-          await binaryFile.delete();
+          // 重新下载
+          await storageFile.delete();
         }
       }
 
-      // 获取设备架构
-      final abi = await getAbi();
-      _lastError = '设备架构: $abi';
-
-      // 尝试多个镜像下载
+      // 下载 yt-dlp
       _initStatus = '正在下载 yt-dlp...';
       _initProgress = 0;
       onProgress?.call(0, _initStatus);
 
       bool downloaded = false;
-      for (int i = 0; i < _downloadUrls.length; i++) {
-        final url = _downloadUrls[i];
+      for (final url in _downloadUrls) {
         final mirrorName = _getMirrorName(url);
         _initStatus = '下载 yt-dlp ($mirrorName)...';
         onProgress?.call(0, _initStatus);
@@ -105,7 +108,7 @@ class YtdlpService {
         try {
           await _dio.download(
             url,
-            _binaryPath!,
+            _storagePath!,
             onReceiveProgress: (received, total) {
               if (total > 0) {
                 _initProgress = received / total;
@@ -117,19 +120,17 @@ class YtdlpService {
             options: Options(
               headers: {'Accept': 'application/octet-stream'},
               followRedirects: true,
-              receiveTimeout: const Duration(seconds: 120),
+              receiveTimeout: const Duration(seconds: 180),
               connectTimeout: const Duration(seconds: 30),
             ),
           );
 
-          final file = File(_binaryPath!);
+          final file = File(_storagePath!);
           if (await file.exists() && await file.length() > 10000) {
             downloaded = true;
             break;
-          } else {
-            _lastError = '$mirrorName: 下载文件太小';
-            if (await file.exists()) await file.delete();
           }
+          if (await file.exists()) await file.delete();
         } catch (e) {
           _lastError = '$mirrorName: $e';
           continue;
@@ -142,15 +143,18 @@ class YtdlpService {
         return false;
       }
 
-      // 通过原生层设置可执行权限
-      _initStatus = '设置权限...';
+      // 复制到可执行目录
+      _initStatus = '准备执行环境...';
       onProgress?.call(0.9, _initStatus);
-      final chmodOk = await _setExecutable(_binaryPath!);
-      if (!chmodOk) {
-        _lastError = '设置可执行权限失败';
+
+      _execPath = await _prepareBinary(_storagePath!);
+      if (_execPath == null) {
+        _initStatus = '无法创建可执行环境';
+        onProgress?.call(0, _initStatus);
+        return false;
       }
 
-      // 验证二进制
+      // 验证
       _initStatus = '验证安装...';
       onProgress?.call(1.0, _initStatus);
       final result = await _execBinary(['--version']);
@@ -162,9 +166,7 @@ class YtdlpService {
         return true;
       }
 
-      final stderr = result['stderr'] ?? '';
-      final exitCode = result['exitCode'];
-      _lastError = '验证失败: exitCode=$exitCode\nstderr: $stderr\npath: $_binaryPath';
+      _lastError = '验证失败: exitCode=${result['exitCode']}\nstderr: ${result['stderr']}';
       _initStatus = 'yt-dlp 验证失败';
       onProgress?.call(0, _initStatus);
       return false;
@@ -183,21 +185,24 @@ class YtdlpService {
     return '官方';
   }
 
-  /// 通过原生层执行 yt-dlp 二进制
+  /// 通过原生层执行 yt-dlp
   Future<Map<String, dynamic>> _execBinary(List<String> args) async {
+    if (_execPath == null) {
+      return {'exitCode': -1, 'stdout': '', 'stderr': '可执行路径未设置'};
+    }
+
     try {
       final appDir = (await getApplicationDocumentsDirectory()).path;
       final tmpDir = (await getTemporaryDirectory()).path;
 
       final result = await _channel.invokeMethod<Map>('exec', {
-        'command': _binaryPath,
+        'binaryPath': _execPath,
         'args': args,
         'env': {
           'HOME': appDir,
           'TMPDIR': tmpDir,
-          'PATH': '/system/bin:/system/xbin:$appDir/bin',
+          'PATH': '/system/bin:/system/xbin',
         },
-        'workDir': appDir,
         'timeout': 120,
       });
 
@@ -216,91 +221,65 @@ class YtdlpService {
     }
   }
 
-  /// 从视频链接提取最佳音频下载 URL
   Future<AudioInfo?> extractAudio(String videoUrl) async {
-    if (!_initialized || _binaryPath == null) {
+    if (!_initialized) {
       final ok = await init();
       if (!ok) return null;
     }
 
-    try {
-      final result = await _execBinary([
-        '--no-warnings',
-        '--no-playlist',
-        '-j',
-        '-f', 'bestaudio/best',
-        '--no-check-certificates',
-        videoUrl,
-      ]);
+    final result = await _execBinary([
+      '--no-warnings', '--no-playlist', '-j',
+      '-f', 'bestaudio/best', '--no-check-certificates',
+      videoUrl,
+    ]);
 
-      if (result['exitCode'] != 0) {
-        throw Exception('yt-dlp 错误: ${result['stderr']}');
-      }
-
-      final jsonStr = (result['stdout'] as String).trim();
-      if (jsonStr.isEmpty) throw Exception('yt-dlp 返回为空');
-
-      return _parseAudioInfo(jsonStr);
-    } catch (e) {
-      throw Exception('提取音频失败: $e');
+    if (result['exitCode'] != 0) {
+      throw Exception('yt-dlp 错误: ${result['stderr']}');
     }
+
+    final jsonStr = (result['stdout'] as String).trim();
+    if (jsonStr.isEmpty) throw Exception('yt-dlp 返回为空');
+
+    return _parseAudioInfo(jsonStr);
   }
 
-  /// 直接获取音频下载 URL
   Future<String?> getAudioUrl(String videoUrl) async {
-    if (!_initialized || _binaryPath == null) {
+    if (!_initialized) {
       final ok = await init();
       if (!ok) return null;
     }
 
-    try {
-      final result = await _execBinary([
-        '--no-warnings',
-        '--no-playlist',
-        '--get-url',
-        '-f', 'bestaudio/best',
-        '--no-check-certificates',
-        videoUrl,
-      ]);
+    final result = await _execBinary([
+      '--no-warnings', '--no-playlist', '--get-url',
+      '-f', 'bestaudio/best', '--no-check-certificates',
+      videoUrl,
+    ]);
 
-      if (result['exitCode'] != 0) return null;
-      final url = (result['stdout'] as String).trim();
-      return url.isNotEmpty ? url : null;
-    } catch (e) {
-      return null;
-    }
+    if (result['exitCode'] != 0) return null;
+    final url = (result['stdout'] as String).trim();
+    return url.isNotEmpty ? url : null;
   }
 
-  /// 获取视频标题
   Future<String?> getTitle(String videoUrl) async {
-    if (!_initialized || _binaryPath == null) {
+    if (!_initialized) {
       final ok = await init();
       if (!ok) return null;
     }
 
-    try {
-      final result = await _execBinary([
-        '--no-warnings',
-        '--no-playlist',
-        '--get-title',
-        '--no-check-certificates',
-        videoUrl,
-      ]);
+    final result = await _execBinary([
+      '--no-warnings', '--no-playlist', '--get-title',
+      '--no-check-certificates', videoUrl,
+    ]);
 
-      if (result['exitCode'] != 0) return null;
-      final title = (result['stdout'] as String).trim();
-      return title.isNotEmpty ? title : null;
-    } catch (e) {
-      return null;
-    }
+    if (result['exitCode'] != 0) return null;
+    final title = (result['stdout'] as String).trim();
+    return title.isNotEmpty ? title : null;
   }
 
-  /// 解析 yt-dlp JSON 输出
   AudioInfo _parseAudioInfo(String jsonStr) {
     String? extractString(String key) {
       final pattern = RegExp('"$key"\\s*:\\s*"([^"]*)"');
-      final match = pattern.firstMatch(jsonStr);
-      return match?.group(1);
+      return pattern.firstMatch(jsonStr)?.group(1);
     }
 
     int? extractInt(String key) {
@@ -309,19 +288,12 @@ class YtdlpService {
       return match != null ? int.tryParse(match.group(1)!) : null;
     }
 
-    final title = extractString('title') ?? '未知标题';
-    final url = extractString('url');
-    final webpageUrl = extractString('webpage_url') ?? '';
-    final extractor = extractString('extractor') ?? '';
-    final duration = extractInt('duration') ?? 0;
-    final ext = extractString('ext') ?? 'm4a';
-
     return AudioInfo(
-      title: title,
-      url: url ?? webpageUrl,
-      extractor: extractor,
-      duration: duration,
-      extension: ext,
+      title: extractString('title') ?? '未知标题',
+      url: extractString('url') ?? extractString('webpage_url') ?? '',
+      extractor: extractString('extractor') ?? '',
+      duration: extractInt('duration') ?? 0,
+      extension: extractString('ext') ?? 'm4a',
     );
   }
 
@@ -330,7 +302,6 @@ class YtdlpService {
   }
 }
 
-/// 音频信息
 class AudioInfo {
   final String title;
   final String url;
