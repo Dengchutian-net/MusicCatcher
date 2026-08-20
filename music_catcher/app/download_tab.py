@@ -1,6 +1,7 @@
 """下载标签页：粘贴 URL → 选择格式 → 一键下载。"""
 
 import os
+import re
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QComboBox, QPushButton, QProgressBar,
@@ -8,6 +9,24 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal
 from engine.downloader import DownloadWorker, probe_url
+
+
+def extract_urls(text: str) -> list[str]:
+    """从文本中提取所有 URL。
+
+    支持从分享文字中提取，如：
+    - "xxx-哔哩哔哩】 https://b23.tv/abc"
+    - "前奏一响... https://xhslink.cn/o/xxx 【小红书】"
+    """
+    # 匹配 http/https 链接，遇到空白或非ASCII字符就截止
+    pattern = r'https?://[\w\-._~:/?#\[\]@!$&\'()*+,;=%]+'
+    urls = re.findall(pattern, text)
+    # 清理尾部可能误捕获的标点
+    cleaned = []
+    for url in urls:
+        url = url.rstrip('.,;:!?\'")]}')
+        cleaned.append(url)
+    return cleaned
 
 
 class ProbeWorker(QThread):
@@ -43,7 +62,7 @@ class DownloadTab(QWidget):
         url_row = QHBoxLayout()
         url_label = QLabel("链接:")
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("粘贴音乐/视频链接...")
+        self.url_input.setPlaceholderText("粘贴链接或分享文字...")
         self.url_input.returnPressed.connect(self._on_download)
         url_row.addWidget(url_label)
         url_row.addWidget(self.url_input, 1)
@@ -122,10 +141,25 @@ class DownloadTab(QWidget):
             self.dir_label.setText(d)
 
     def _on_download(self):
-        url = self.url_input.text().strip()
-        if not url:
-            self._log("⚠ 请先输入链接")
+        raw = self.url_input.text().strip()
+        if not raw:
+            self._log("请先输入链接")
             return
+
+        # 从文本中提取 URL
+        urls = extract_urls(raw)
+        if not urls:
+            self._log("未识别到链接，请检查输入")
+            return
+
+        # 多个链接时提示，取第一个
+        if len(urls) > 1:
+            self._log(f"检测到 {len(urls)} 个链接，使用第一个")
+
+        url = urls[0]
+        if url != raw:
+            self._log(f"提取链接: {url}")
+            self.url_input.setText(url)
 
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -142,13 +176,13 @@ class DownloadTab(QWidget):
         title = info.get("title", "未知")
         duration = info.get("duration", 0)
         mins, secs = divmod(duration, 60)
-        self.info_label.setText(f"🎵 {title}  ({int(mins)}:{int(secs):02d})")
-        self._log(f"✓ 解析成功: {title}")
+        self.info_label.setText(f"{title}  ({int(mins)}:{int(secs):02d})")
+        self._log(f"解析成功: {title}")
         self._start_download()
 
     def _on_probe_error(self, msg: str):
         self.info_label.setText("")
-        self._log(f"✗ {msg}")
+        self._log(f"{msg}")
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
@@ -171,13 +205,13 @@ class DownloadTab(QWidget):
 
     def _on_finished(self, path: str):
         self.progress_bar.setValue(100)
-        self._log(f"✓ 已保存: {os.path.basename(path)}")
-        self.info_label.setText(f"✅ 完成 → {path}")
+        self._log(f"已保存: {os.path.basename(path)}")
+        self.info_label.setText(f"完成 -> {path}")
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
 
     def _on_error(self, msg: str):
-        self._log(f"✗ 下载失败: {msg}")
+        self._log(f"下载失败: {msg}")
         self.progress_bar.setValue(0)
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -186,7 +220,7 @@ class DownloadTab(QWidget):
         if self._worker:
             self._worker.cancel()
             self._worker.wait(3000)
-        self._log("⚠ 已取消下载")
+        self._log("已取消下载")
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.progress_bar.setValue(0)
