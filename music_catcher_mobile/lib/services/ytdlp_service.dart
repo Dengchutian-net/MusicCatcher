@@ -1,11 +1,13 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// yt-dlp 本地执行服务
-/// 在 Android 上下载并运行 yt-dlp 二进制文件，提取音频下载链接
+/// 通过 Android MethodChannel 在原生层执行 yt-dlp 二进制
 class YtdlpService {
   static const _binaryName = 'yt-dlp';
+  static const _channel = MethodChannel('com.musiccatcher/native_exec');
 
   /// 多个下载源（国内镜像 + 官方），依次尝试
   static const _downloadUrls = [
@@ -28,6 +30,26 @@ class YtdlpService {
   String? get binaryPath => _binaryPath;
   String? get lastError => _lastError;
 
+  /// 获取设备 CPU 架构
+  Future<String> getAbi() async {
+    try {
+      final abi = await _channel.invokeMethod<String>('getAbi');
+      return abi ?? 'unknown';
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  /// 通过原生层设置文件可执行权限
+  Future<bool> _setExecutable(String path) async {
+    try {
+      final result = await _channel.invokeMethod<bool>('setExecutable', {'path': path});
+      return result ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 初始化：检查或下载 yt-dlp 二进制
   Future<bool> init({void Function(double progress, String status)? onProgress}) async {
     if (_initialized) return true;
@@ -46,29 +68,27 @@ class YtdlpService {
       // 检查已有的二进制
       if (await binaryFile.exists()) {
         final fileSize = await binaryFile.length();
-        if (fileSize < 1000) {
-          // 文件太小，可能是下载失败的残留
+        if (fileSize < 10000) {
           await binaryFile.delete();
         } else {
           _initStatus = '验证 yt-dlp...';
           onProgress?.call(1.0, _initStatus);
-          try {
-            final result = await _runBinary(['--version']);
-            if (result.exitCode == 0) {
-              _initialized = true;
-              final version = result.stdout.toString().trim();
-              _initStatus = 'yt-dlp 就绪 (v$version)';
-              onProgress?.call(1.0, _initStatus);
-              return true;
-            }
-            _lastError = '执行失败: exitCode=${result.exitCode}, stderr=${result.stderr}';
-          } catch (e) {
-            _lastError = '执行异常: $e';
+          final result = await _execBinary(['--version']);
+          if (result['exitCode'] == 0) {
+            _initialized = true;
+            final version = (result['stdout'] as String).trim();
+            _initStatus = 'yt-dlp 就绪 (v$version)';
+            onProgress?.call(1.0, _initStatus);
+            return true;
           }
-          // 二进制不可用，删除重新下载
+          _lastError = '执行失败: ${result['stderr']}';
           await binaryFile.delete();
         }
       }
+
+      // 获取设备架构
+      final abi = await getAbi();
+      _lastError = '设备架构: $abi';
 
       // 尝试多个镜像下载
       _initStatus = '正在下载 yt-dlp...';
@@ -102,13 +122,12 @@ class YtdlpService {
             ),
           );
 
-          // 验证下载的文件大小
           final file = File(_binaryPath!);
           if (await file.exists() && await file.length() > 10000) {
             downloaded = true;
             break;
           } else {
-            _lastError = '$mirrorName: 下载文件太小，可能不是有效二进制';
+            _lastError = '$mirrorName: 下载文件太小';
             if (await file.exists()) await file.delete();
           }
         } catch (e) {
@@ -123,36 +142,29 @@ class YtdlpService {
         return false;
       }
 
-      // 设置可执行权限
+      // 通过原生层设置可执行权限
       _initStatus = '设置权限...';
       onProgress?.call(0.9, _initStatus);
-      try {
-        final chmodResult = await Process.run('chmod', ['755', _binaryPath!]);
-        if (chmodResult.exitCode != 0) {
-          _lastError = 'chmod 失败: ${chmodResult.stderr}';
-        }
-      } catch (e) {
-        _lastError = 'chmod 异常: $e';
-        // 继续尝试，有些系统可能不需要 chmod
+      final chmodOk = await _setExecutable(_binaryPath!);
+      if (!chmodOk) {
+        _lastError = '设置可执行权限失败';
       }
 
-      // 验证二进制是否可执行
+      // 验证二进制
       _initStatus = '验证安装...';
       onProgress?.call(1.0, _initStatus);
-      try {
-        final result = await _runBinary(['--version']);
-        if (result.exitCode == 0) {
-          _initialized = true;
-          final version = result.stdout.toString().trim();
-          _initStatus = 'yt-dlp 就绪 (v$version)';
-          onProgress?.call(1.0, _initStatus);
-          return true;
-        }
-        _lastError = '验证失败: exitCode=${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}';
-      } catch (e) {
-        _lastError = '执行二进制失败: $e\n可能原因：CPU架构不匹配或缺少系统依赖';
+      final result = await _execBinary(['--version']);
+      if (result['exitCode'] == 0) {
+        _initialized = true;
+        final version = (result['stdout'] as String).trim();
+        _initStatus = 'yt-dlp 就绪 (v$version)';
+        onProgress?.call(1.0, _initStatus);
+        return true;
       }
 
+      final stderr = result['stderr'] ?? '';
+      final exitCode = result['exitCode'];
+      _lastError = '验证失败: exitCode=$exitCode\nstderr: $stderr\npath: $_binaryPath';
       _initStatus = 'yt-dlp 验证失败';
       onProgress?.call(0, _initStatus);
       return false;
@@ -171,6 +183,39 @@ class YtdlpService {
     return '官方';
   }
 
+  /// 通过原生层执行 yt-dlp 二进制
+  Future<Map<String, dynamic>> _execBinary(List<String> args) async {
+    try {
+      final appDir = (await getApplicationDocumentsDirectory()).path;
+      final tmpDir = (await getTemporaryDirectory()).path;
+
+      final result = await _channel.invokeMethod<Map>('exec', {
+        'command': _binaryPath,
+        'args': args,
+        'env': {
+          'HOME': appDir,
+          'TMPDIR': tmpDir,
+          'PATH': '/system/bin:/system/xbin:$appDir/bin',
+        },
+        'workDir': appDir,
+        'timeout': 120,
+      });
+
+      if (result == null) {
+        return {'exitCode': -1, 'stdout': '', 'stderr': '原生层返回 null'};
+      }
+
+      return {
+        'exitCode': result['exitCode'] ?? -1,
+        'stdout': result['stdout'] ?? '',
+        'stderr': result['stderr'] ?? '',
+        'timeout': result['timeout'] ?? false,
+      };
+    } catch (e) {
+      return {'exitCode': -1, 'stdout': '', 'stderr': 'MethodChannel 异常: $e'};
+    }
+  }
+
   /// 从视频链接提取最佳音频下载 URL
   Future<AudioInfo?> extractAudio(String videoUrl) async {
     if (!_initialized || _binaryPath == null) {
@@ -179,7 +224,7 @@ class YtdlpService {
     }
 
     try {
-      final result = await _runBinary([
+      final result = await _execBinary([
         '--no-warnings',
         '--no-playlist',
         '-j',
@@ -188,12 +233,11 @@ class YtdlpService {
         videoUrl,
       ]);
 
-      if (result.exitCode != 0) {
-        final stderr = result.stderr.toString();
-        throw Exception('yt-dlp 错误: $stderr');
+      if (result['exitCode'] != 0) {
+        throw Exception('yt-dlp 错误: ${result['stderr']}');
       }
 
-      final jsonStr = result.stdout.toString().trim();
+      final jsonStr = (result['stdout'] as String).trim();
       if (jsonStr.isEmpty) throw Exception('yt-dlp 返回为空');
 
       return _parseAudioInfo(jsonStr);
@@ -210,7 +254,7 @@ class YtdlpService {
     }
 
     try {
-      final result = await _runBinary([
+      final result = await _execBinary([
         '--no-warnings',
         '--no-playlist',
         '--get-url',
@@ -219,8 +263,8 @@ class YtdlpService {
         videoUrl,
       ]);
 
-      if (result.exitCode != 0) return null;
-      final url = result.stdout.toString().trim();
+      if (result['exitCode'] != 0) return null;
+      final url = (result['stdout'] as String).trim();
       return url.isNotEmpty ? url : null;
     } catch (e) {
       return null;
@@ -235,7 +279,7 @@ class YtdlpService {
     }
 
     try {
-      final result = await _runBinary([
+      final result = await _execBinary([
         '--no-warnings',
         '--no-playlist',
         '--get-title',
@@ -243,8 +287,8 @@ class YtdlpService {
         videoUrl,
       ]);
 
-      if (result.exitCode != 0) return null;
-      final title = result.stdout.toString().trim();
+      if (result['exitCode'] != 0) return null;
+      final title = (result['stdout'] as String).trim();
       return title.isNotEmpty ? title : null;
     } catch (e) {
       return null;
@@ -278,20 +322,6 @@ class YtdlpService {
       extractor: extractor,
       duration: duration,
       extension: ext,
-    );
-  }
-
-  /// 运行 yt-dlp 二进制
-  Future<ProcessResult> _runBinary(List<String> args) async {
-    final appDir = (await getApplicationDocumentsDirectory()).path;
-    return await Process.run(
-      _binaryPath!,
-      args,
-      environment: {
-        'HOME': appDir,
-        'TMPDIR': (await getTemporaryDirectory()).path,
-        'PATH': '/system/bin:/system/xbin:$appDir/bin',
-      },
     );
   }
 
