@@ -2,11 +2,9 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// yt-dlp 本地执行服务
-/// 使用打包在 APK native lib 目录中的 yt-dlp 二进制
-/// 该目录天然可执行，无需额外权限
+/// 从 APK assets 提取二进制到 native lib 目录执行
 class YtdlpService {
   static const _channel = MethodChannel('com.musiccatcher/native_exec');
-  static const _binaryName = 'libytdlp.so'; // native library 命名
 
   bool _initialized = false;
   String? _binaryPath;
@@ -17,29 +15,31 @@ class YtdlpService {
   String get initStatus => _initStatus;
   String? get lastError => _lastError;
 
-  /// 初始化：定位打包的 yt-dlp 二进制
   Future<bool> init({void Function(double progress, String status)? onProgress}) async {
     if (_initialized) return true;
     _lastError = null;
 
     try {
-      _initStatus = '正在定位 yt-dlp...';
-      onProgress?.call(0.5, _initStatus);
+      _initStatus = '正在准备 yt-dlp 引擎...';
+      onProgress?.call(0.3, _initStatus);
 
-      // 获取 native lib 目录路径
-      final nativeLibDir = await _channel.invokeMethod<String>('getNativeLibDir');
-      if (nativeLibDir == null) {
-        _lastError = '无法获取 native library 目录';
+      // 从 assets 提取到可执行目录
+      final path = await _channel.invokeMethod<String>('extractBinary', {
+        'assetPath': 'bin/yt-dlp',
+      });
+
+      if (path == null) {
+        _lastError = '无法提取 yt-dlp 二进制到可执行目录';
         _initStatus = '初始化失败';
         onProgress?.call(0, _initStatus);
         return false;
       }
 
-      _binaryPath = '$nativeLibDir/$_binaryName';
+      _binaryPath = path;
       _initStatus = '验证 yt-dlp...';
       onProgress?.call(0.8, _initStatus);
 
-      // 验证二进制是否可执行
+      // 验证
       final result = await _execBinary(['--version']);
       if (result['exitCode'] == 0) {
         _initialized = true;
@@ -49,7 +49,7 @@ class YtdlpService {
         return true;
       }
 
-      _lastError = '执行失败: exitCode=${result['exitCode']}\n'
+      _lastError = '验证失败: exitCode=${result['exitCode']}\n'
           'stderr: ${result['stderr']}\n'
           'path: $_binaryPath';
       _initStatus = 'yt-dlp 验证失败';
@@ -63,7 +63,6 @@ class YtdlpService {
     }
   }
 
-  /// 通过原生层执行 yt-dlp
   Future<Map<String, dynamic>> _execBinary(List<String> args) async {
     if (_binaryPath == null) {
       return {'exitCode': -1, 'stdout': '', 'stderr': '二进制路径未设置'};

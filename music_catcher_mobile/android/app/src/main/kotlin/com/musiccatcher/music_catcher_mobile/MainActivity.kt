@@ -5,6 +5,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
 
@@ -29,6 +31,15 @@ class MainActivity : FlutterActivity() {
                         result.error("EXEC_ERROR", e.message, e.stackTraceToString())
                     }
                 }
+                "extractBinary" -> {
+                    val assetPath = call.argument<String>("assetPath") ?: "bin/yt-dlp"
+                    try {
+                        val path = extractBinaryFromAssets(assetPath)
+                        result.success(path)
+                    } catch (e: Exception) {
+                        result.error("EXTRACT_ERROR", e.message, e.stackTraceToString())
+                    }
+                }
                 "getNativeLibDir" -> {
                     result.success(applicationContext.applicationInfo.nativeLibraryDir)
                 }
@@ -38,6 +49,55 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    /**
+     * 从 APK assets 中提取二进制文件到 native lib 目录（允许执行）
+     */
+    private fun extractBinaryFromAssets(assetPath: String): String? {
+        val nativeLibDir = applicationContext.applicationInfo.nativeLibraryDir
+        val destFile = File(nativeLibDir, "yt-dlp")
+
+        // 如果已提取且大小正确，直接返回
+        if (destFile.exists() && destFile.length() > 10000) {
+            return destFile.absolutePath
+        }
+
+        // 从 assets 提取
+        try {
+            assets.open(assetPath).use { input ->
+                FileOutputStream(destFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            destFile.setExecutable(true, false)
+            destFile.setReadable(true, false)
+
+            if (destFile.exists() && destFile.canExecute()) {
+                return destFile.absolutePath
+            }
+        } catch (e: Exception) {
+            // native lib 目录可能只读，尝试其他方式
+        }
+
+        // 备选：复制到 cache 目录（部分设备允许执行）
+        val cacheDir = applicationContext.cacheDir
+        val cacheFile = File(cacheDir, "yt-dlp")
+        try {
+            assets.open(assetPath).use { input ->
+                FileOutputStream(cacheFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            cacheFile.setExecutable(true, false)
+            if (cacheFile.exists() && cacheFile.length() > 10000) {
+                return cacheFile.absolutePath
+            }
+        } catch (e: Exception) {
+            // 继续
+        }
+
+        return null
     }
 
     private fun execBinary(
