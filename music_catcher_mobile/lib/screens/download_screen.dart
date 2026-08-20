@@ -17,6 +17,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
   String _status = '';
   bool _isDownloading = false;
   bool _ytdlpReady = false;
+  bool _ytdlpLoading = true;
   String _ytdlpStatus = '检查中...';
 
   @override
@@ -26,7 +27,10 @@ class _DownloadScreenState extends State<DownloadScreen> {
   }
 
   Future<void> _initYtdlp() async {
-    setState(() => _ytdlpStatus = '正在初始化 yt-dlp...');
+    setState(() {
+      _ytdlpLoading = true;
+      _ytdlpStatus = '正在初始化 yt-dlp...';
+    });
     final ok = await _downloadService.ytdlp.init(
       onProgress: (p, s) {
         if (mounted) setState(() => _ytdlpStatus = s);
@@ -35,6 +39,7 @@ class _DownloadScreenState extends State<DownloadScreen> {
     if (mounted) {
       setState(() {
         _ytdlpReady = ok;
+        _ytdlpLoading = false;
         _ytdlpStatus = _downloadService.ytdlp.initStatus;
       });
     }
@@ -83,6 +88,25 @@ class _DownloadScreenState extends State<DownloadScreen> {
     }
   }
 
+  void _showErrorDetail() {
+    final error = _downloadService.ytdlp.lastError ?? '未知错误';
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('yt-dlp 初始化详情'),
+        content: SingleChildScrollView(
+          child: Text(error, style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -96,38 +120,58 @@ class _DownloadScreenState extends State<DownloadScreen> {
             Card(
               color: _ytdlpReady
                   ? Theme.of(context).colorScheme.primaryContainer
-                  : Theme.of(context).colorScheme.errorContainer,
+                  : _ytdlpLoading
+                      ? Theme.of(context).colorScheme.surfaceContainerHigh
+                      : Theme.of(context).colorScheme.errorContainer,
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
                   children: [
-                    Icon(
-                      _ytdlpReady ? Icons.check_circle : Icons.sync,
-                      size: 18,
-                      color: _ytdlpReady
-                          ? Theme.of(context).colorScheme.onPrimaryContainer
-                          : Theme.of(context).colorScheme.onErrorContainer,
-                    ),
+                    if (_ytdlpLoading)
+                      SizedBox(
+                        width: 16, height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2,
+                            color: Theme.of(context).colorScheme.onSurfaceVariant),
+                      )
+                    else
+                      Icon(
+                        _ytdlpReady ? Icons.check_circle : Icons.error_outline,
+                        size: 16,
+                        color: _ytdlpReady
+                            ? Theme.of(context).colorScheme.onPrimaryContainer
+                            : Theme.of(context).colorScheme.onErrorContainer,
+                      ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
                         _ytdlpStatus,
-                        style: TextStyle(
-                          fontSize: 12,
+                        style: TextStyle(fontSize: 12,
                           color: _ytdlpReady
                               ? Theme.of(context).colorScheme.onPrimaryContainer
-                              : Theme.of(context).colorScheme.onErrorContainer,
+                              : _ytdlpLoading
+                                  ? Theme.of(context).colorScheme.onSurfaceVariant
+                                  : Theme.of(context).colorScheme.onErrorContainer,
                         ),
-                        maxLines: 1,
+                        maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
-                    if (!_ytdlpReady)
-                      SizedBox(
-                        width: 14, height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2,
-                            color: Theme.of(context).colorScheme.onErrorContainer),
+                    if (!_ytdlpReady && !_ytdlpLoading) ...[
+                      IconButton(
+                        icon: const Icon(Icons.info_outline, size: 16),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                        onPressed: _showErrorDetail,
+                        tooltip: '查看详情',
                       ),
+                      IconButton(
+                        icon: const Icon(Icons.refresh, size: 16),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                        onPressed: _initYtdlp,
+                        tooltip: '重试',
+                      ),
+                    ],
                   ],
                 ),
               ),
